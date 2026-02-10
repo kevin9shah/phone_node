@@ -292,6 +292,12 @@ class DistributedTaskManager:
             completed_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.COMPLETED]
             failed_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.FAILED]
             
+            latest_completed_result = None
+            for t in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True):
+                if t.status == TaskStatus.COMPLETED and t.result:
+                    latest_completed_result = t.result
+                    break
+
             return {
                 "timestamp": now.isoformat(),
                 "nodes": {
@@ -336,7 +342,8 @@ class DistributedTaskManager:
                         }
                         for t in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True)[:20]
                     ]
-                }
+                },
+                "latest_result": latest_completed_result
             }
 
 
@@ -722,6 +729,8 @@ def dashboard():
             function renderStatus(data) {
                 const nodes = data.nodes;
                 const tasks = data.tasks;
+                const latest = tasks.latest_result;
+                const latestMetrics = latest ? (latest.result ? latest.result : latest) : null;
                 
                 const html = `
                     <div class="grid">
@@ -771,6 +780,43 @@ def dashboard():
                                 <span class="stat-label">Queue Size</span>
                                 <span class="stat-value">${tasks.queue_size}</span>
                             </div>
+                        </div>
+                    </div>
+
+                    <div class="grid">
+                        <div class="card">
+                            <h2>🧮 Latest Phone Calculations</h2>
+                            ${latestMetrics ? `
+                                <div class="stat">
+                                    <span class="stat-label">Congestion</span>
+                                    <span class="stat-value">${latestMetrics.congestion_level?.toUpperCase?.() || latestMetrics.congestion_level} (${latestMetrics.congestion_score}/10)</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Movements</span>
+                                    <span class="stat-value">${latestMetrics.total_movements} (A ${latestMetrics.arrivals} / D ${latestMetrics.departures})</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Density</span>
+                                    <span class="stat-value">${latestMetrics.traffic_density} /hr</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Occupancy</span>
+                                    <span class="stat-value">${latestMetrics.runway_occupancy_percent}%</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Spacing (avg / min)</span>
+                                    <span class="stat-value">${latestMetrics.avg_spacing_minutes}m / ${latestMetrics.min_spacing_minutes}m</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Peak Hour</span>
+                                    <span class="stat-value">${String(latestMetrics.peak_hour).padStart(2,'0')}:00 (${latestMetrics.peak_hour_movements})</span>
+                                </div>
+                                <div class="timestamp">
+                                    Computed at: ${latestMetrics.computed_at}
+                                </div>
+                            ` : `
+                                <div style="color: #94a3b8;">No completed phone results yet.</div>
+                            `}
                         </div>
                     </div>
 
