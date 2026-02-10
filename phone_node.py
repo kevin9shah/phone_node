@@ -34,14 +34,14 @@ class NodeStats:
     def print_stats(self):
         uptime = time.time() - self.start_time
         print("\n" + "="*60)
-        print(f"📊 NODE STATISTICS ({NODE_ID})")
+        print(f" NODE STATISTICS ({NODE_ID})")
         print("="*60)
-        print(f"⏱️  Uptime: {uptime:.0f}s ({uptime/60:.1f} minutes)")
-        print(f"💓 Heartbeats: {self.heartbeats_sent} sent, {self.heartbeat_failures} failed")
-        print(f"📋 Tasks: {self.tasks_fetched} fetched, {self.tasks_completed} completed, {self.tasks_failed} failed")
+        print(f" Uptime: {uptime:.0f}s ({uptime/60:.1f} minutes)")
+        print(f" Heartbeats: {self.heartbeats_sent} sent, {self.heartbeat_failures} failed")
+        print(f" Tasks: {self.tasks_fetched} fetched, {self.tasks_completed} completed, {self.tasks_failed} failed")
         if self.tasks_completed > 0:
             avg_time = self.total_task_time / self.tasks_completed
-            print(f"⚡ Average task time: {avg_time:.2f}s")
+            print(f" Average task time: {avg_time:.2f}s")
         print("="*60 + "\n")
 
 stats = NodeStats()
@@ -50,7 +50,8 @@ stats = NodeStats()
 def log(emoji: str, message: str, level: str = "INFO"):
     """Formatted logging with timestamps"""
     timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {emoji} {message}")
+    _ = level
+    print(f"[{timestamp}] {message}")
     
 
 def make_request(method: str, endpoint: str, **kwargs) -> Optional[requests.Response]:
@@ -70,20 +71,103 @@ def make_request(method: str, endpoint: str, **kwargs) -> Optional[requests.Resp
             return response
             
         except requests.exceptions.Timeout:
-            log("⏰", f"Request timeout (attempt {attempt + 1}/{MAX_RETRIES})", "WARN")
+            log("", f"Request timeout (attempt {attempt + 1}/{MAX_RETRIES})", "WARN")
         except requests.exceptions.ConnectionError:
-            log("🔌", f"Connection error (attempt {attempt + 1}/{MAX_RETRIES})", "WARN")
+            log("", f"Connection error (attempt {attempt + 1}/{MAX_RETRIES})", "WARN")
         except requests.exceptions.HTTPError as e:
-            log("❌", f"HTTP error: {e.response.status_code}", "ERROR")
+            log("", f"HTTP error: {e.response.status_code}", "ERROR")
             return None
         except Exception as e:
-            log("💥", f"Unexpected error: {str(e)}", "ERROR")
+            log("", f"Unexpected error: {str(e)}", "ERROR")
             return None
         
         if attempt < MAX_RETRIES - 1:
             time.sleep(1)  # Wait before retry
     
     return None
+
+
+def _linear_regression(xs, ys):
+    if not xs or not ys or len(xs) != len(ys):
+        return 0.0, 0.0
+    n = len(xs)
+    x_mean = sum(xs) / n
+    y_mean = sum(ys) / n
+    num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    den = sum((x - x_mean) ** 2 for x in xs)
+    if den == 0:
+        return 0.0, y_mean
+    slope = num / den
+    intercept = y_mean - slope * x_mean
+    return slope, intercept
+
+
+def _compute_ml_forecast(traffic_movements, window_minutes, window_start_str=None, window_end_str=None):
+    if not traffic_movements:
+        return None
+    try:
+        if window_start_str:
+            window_start = datetime.fromisoformat(window_start_str)
+        else:
+            window_start = min(datetime.fromisoformat(m["timestamp_utc"]) for m in traffic_movements)
+        if window_end_str:
+            window_end = datetime.fromisoformat(window_end_str)
+        else:
+            window_end = max(datetime.fromisoformat(m["timestamp_utc"]) for m in traffic_movements)
+    except Exception:
+        return None
+
+    bin_minutes = 5
+    bin_seconds = bin_minutes * 60
+    total_seconds = max(0, (window_end - window_start).total_seconds())
+    bins = int(total_seconds // bin_seconds) + 1
+    counts = [0] * bins
+    occ_sums = [0.0] * bins
+
+    for m in traffic_movements:
+        try:
+            ts = datetime.fromisoformat(m["timestamp_utc"])
+            idx = int((ts - window_start).total_seconds() // bin_seconds)
+            if idx < 0:
+                continue
+            if idx >= bins:
+                idx = bins - 1
+            counts[idx] += 1
+            occ_sums[idx] += float(m.get("occupancy_seconds", 0))
+        except Exception:
+            continue
+
+    xs = list(range(bins))
+    density_series = [c * (60.0 / bin_minutes) for c in counts]
+    occupancy_series = [
+        min(100.0, (occ / bin_seconds) * 100.0) if bin_seconds > 0 else 0.0
+        for occ in occ_sums
+    ]
+
+    slope_d, intercept_d = _linear_regression(xs, density_series)
+    slope_o, intercept_o = _linear_regression(xs, occupancy_series)
+    next_x = bins
+    pred_density = max(0.0, slope_d * next_x + intercept_d)
+    pred_occupancy = max(0.0, min(100.0, slope_o * next_x + intercept_o))
+
+    if pred_density > 30 or pred_occupancy > 70:
+        pred_level = "high"
+    elif pred_density > 15 or pred_occupancy > 40:
+        pred_level = "medium"
+    else:
+        pred_level = "low"
+
+    return {
+        "method": "linear_regression",
+        "bin_minutes": bin_minutes,
+        "samples": bins,
+        "predicted_traffic_density_per_hr": round(pred_density, 2),
+        "predicted_runway_occupancy_percent": round(pred_occupancy, 1),
+        "predicted_congestion_level": pred_level,
+        "trend_density_per_bin": round(slope_d, 3),
+        "trend_occupancy_percent_per_bin": round(slope_o, 3),
+        "window_minutes": window_minutes,
+    }
 
 
 def send_heartbeat() -> bool:
@@ -98,36 +182,36 @@ def send_heartbeat() -> bool:
     
     if response:
         stats.heartbeats_sent += 1
-        log("💓", f"Heartbeat sent successfully", "DEBUG")
+        log("", f"Heartbeat sent successfully", "DEBUG")
         return True
     else:
         stats.heartbeat_failures += 1
-        log("💔", "Heartbeat failed", "WARN")
+        log("", "Heartbeat failed", "WARN")
         return False
 
 
 def fetch_task() -> Optional[Dict[str, Any]]:
     """Fetch next task from server"""
-    log("🔍", "Polling for new task...")
+    log("", "Polling for new task...")
     
     response = make_request("GET", "/task", params={"node_id": NODE_ID})
     
     if not response:
-        log("❌", "Failed to fetch task", "ERROR")
+        log("", "Failed to fetch task", "ERROR")
         return None
     
     try:
         task = response.json()
         if task:
             stats.tasks_fetched += 1
-            log("📥", f"Received task: {task.get('task_id')} (type: {task.get('type')})", "INFO")
-            log("  ", f"└─ Assigned at: {task.get('assigned_at')}")
+            log("", f"Received task: {task.get('task_id')} (type: {task.get('type')})", "INFO")
+            log("  ", f" Assigned at: {task.get('assigned_at')}")
             return task
         else:
-            log("📭", "No tasks available in queue", "DEBUG")
+            log("", "No tasks available in queue", "DEBUG")
             return None
     except json.JSONDecodeError:
-        log("💥", "Invalid JSON response", "ERROR")
+        log("", "Invalid JSON response", "ERROR")
         return None
 
 
@@ -136,24 +220,24 @@ def send_task_result(result: Dict[str, Any]) -> bool:
     task_id = result.get('task_id')
     status = result.get('status')
     
-    log("📤", f"Sending result for {task_id} (status: {status})")
+    log("", f"Sending result for {task_id} (status: {status})")
     
     response = make_request("POST", "/task-result", json=result)
     
     if response:
         try:
-            log("📬", f"Server response: {response.status_code} {response.text.strip()}", "DEBUG")
+            log("", f"Server response: {response.status_code} {response.text.strip()}", "DEBUG")
         except Exception:
             pass
         if status == "completed":
             stats.tasks_completed += 1
-            log("✅", f"Task {task_id} result sent successfully", "INFO")
+            log("", f"Task {task_id} result sent successfully", "INFO")
         else:
             stats.tasks_failed += 1
-            log("❌", f"Task {task_id} marked as failed", "WARN")
+            log("", f"Task {task_id} marked as failed", "WARN")
         return True
     else:
-        log("📛", f"Failed to send result for {task_id}", "ERROR")
+        log("", f"Failed to send result for {task_id}", "ERROR")
         return False
 
 
@@ -165,7 +249,7 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     task_id = task.get('task_id')
     task_type = task.get('type')
     
-    log("⚙️", f"Processing task {task_id}...", "INFO")
+    log("", f"Processing task {task_id}...", "INFO")
     start_time = time.time()
     
     try:
@@ -175,10 +259,10 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             traffic_movements = data.get('traffic_movements', [])
             window_minutes = task.get('window_minutes', 60)
             
-            log("  ", f"└─ Analyzing {len(traffic_movements)} traffic movements...")
+            log("  ", f" Analyzing {len(traffic_movements)} traffic movements...")
             
             if not traffic_movements:
-                log("⚠️", "No traffic data to analyze", "WARN")
+                log("", "No traffic data to analyze", "WARN")
                 return {
                     "task_id": task_id,
                     "node_id": NODE_ID,
@@ -192,7 +276,7 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             departures = sum(1 for m in traffic_movements if m['movement_type'] == 'departure')
             total_movements = arrivals + departures
             
-            log("  ", f"└─ Found {arrivals} arrivals, {departures} departures")
+            log("  ", f" Found {arrivals} arrivals, {departures} departures")
             
             # REAL CALCULATION 2: Traffic density (movements per hour)
             window_hours = window_minutes / 60.0
@@ -200,7 +284,7 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             arrival_rate = arrivals / window_hours if window_hours > 0 else 0.0
             departure_rate = departures / window_hours if window_hours > 0 else 0.0
             
-            log("  ", f"└─ Traffic density: {traffic_density:.1f} movements/hour")
+            log("  ", f" Traffic density: {traffic_density:.1f} movements/hour")
             
             # REAL CALCULATION 3: Runway occupancy percentage
             total_occupancy_seconds = sum(m['occupancy_seconds'] for m in traffic_movements)
@@ -208,7 +292,7 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             runway_occupancy = total_occupancy_seconds / window_seconds if window_seconds > 0 else 0.0
             runway_occupancy = min(1.0, runway_occupancy)  # Cap at 100%
             
-            log("  ", f"└─ Runway occupancy: {runway_occupancy*100:.1f}%")
+            log("  ", f" Runway occupancy: {runway_occupancy*100:.1f}%")
             
             # REAL CALCULATION 4: Peak hour detection
             # Group movements by hour and find peak
@@ -221,7 +305,7 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 hourly_counts[hour] += 1
             
             peak_hour = max(hourly_counts.items(), key=lambda x: x[1]) if hourly_counts else (0, 0)
-            log("  ", f"└─ Peak hour: {peak_hour[0]:02d}:00 with {peak_hour[1]} movements")
+            log("  ", f" Peak hour: {peak_hour[0]:02d}:00 with {peak_hour[1]} movements")
             
             # REAL CALCULATION 5: Average spacing between movements
             if len(traffic_movements) > 1:
@@ -239,7 +323,7 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 avg_spacing = sum(gaps) / len(gaps) if gaps else 0.0
                 min_spacing = min(gaps) if gaps else 0.0
                 
-                log("  ", f"└─ Avg spacing: {avg_spacing:.1f} min, Min: {min_spacing:.1f} min")
+                log("  ", f" Avg spacing: {avg_spacing:.1f} min, Min: {min_spacing:.1f} min")
             else:
                 avg_spacing = 0.0
                 min_spacing = 0.0
@@ -258,9 +342,9 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             # Add penalty for tight spacing
             if min_spacing < 3.0 and min_spacing > 0:
                 congestion_score += 2
-                log("  ", f"└─ ⚠️ Tight spacing detected! Added penalty to score")
+                log("  ", f"  Tight spacing detected! Added penalty to score")
             
-            log("  ", f"└─ Congestion: {congestion_level.upper()} (score: {congestion_score}/10)")
+            log("  ", f" Congestion: {congestion_level.upper()} (score: {congestion_score}/10)")
             
             # REAL CALCULATION 7: Movement distribution analysis
             arrival_percentage = (arrivals / total_movements * 100) if total_movements > 0 else 0
@@ -269,7 +353,7 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             # Check for imbalance (runway might be stressed if too many arrivals or departures)
             imbalance = abs(arrival_percentage - 50.0)
             if imbalance > 30:
-                log("  ", f"└─ ⚠️ High imbalance: {arrival_percentage:.0f}% arrivals")
+                log("  ", f"  High imbalance: {arrival_percentage:.0f}% arrivals")
             
             # REAL CALCULATION 8: Occupancy rate by movement type
             arrival_occupancy = sum(m['occupancy_seconds'] for m in traffic_movements if m['movement_type'] == 'arrival')
@@ -278,8 +362,27 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             avg_arrival_time = arrival_occupancy / arrivals if arrivals > 0 else 0
             avg_departure_time = departure_occupancy / departures if departures > 0 else 0
             
-            log("  ", f"└─ Avg times: Arrivals {avg_arrival_time:.0f}s, Departures {avg_departure_time:.0f}s")
+            log("  ", f" Avg times: Arrivals {avg_arrival_time:.0f}s, Departures {avg_departure_time:.0f}s")
             
+            # ML-based forecast (simple linear regression on recent bins)
+            ml = _compute_ml_forecast(
+                traffic_movements,
+                window_minutes,
+                data.get("window_start"),
+                data.get("window_end"),
+            )
+            if ml:
+                log(
+                    "",
+                    "ML forecast: density "
+                    + str(ml.get("predicted_traffic_density_per_hr"))
+                    + "/hr, occupancy "
+                    + str(ml.get("predicted_runway_occupancy_percent"))
+                    + "%, level "
+                    + str(ml.get("predicted_congestion_level")),
+                    "INFO",
+                )
+
             # Build comprehensive result
             result = {
                 "task_id": task_id,
@@ -321,16 +424,19 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "window_minutes": window_minutes,
                     "computed_at": datetime.now().isoformat(),
                     "airport_code": data.get('airport_code', 'UNKNOWN'),
-                    "runway": data.get('runway', 'UNKNOWN')
+                    "runway": data.get('runway', 'UNKNOWN'),
+
+                    # ML findings
+                    "ml": ml
                 },
                 "processing_time_seconds": 0.0,  # Will be filled below
                 "timestamp": time.time()
             }
             
-            log("✨", f"Completed {total_movements} movement analysis", "INFO")
+            log("", f"Completed {total_movements} movement analysis", "INFO")
             
         else:
-            log("⚠️", f"Unknown task type: {task_type}", "WARN")
+            log("", f"Unknown task type: {task_type}", "WARN")
             result = {
                 "task_id": task_id,
                 "node_id": NODE_ID,
@@ -343,14 +449,14 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         result["processing_time_seconds"] = round(processing_time, 3)
         stats.total_task_time += processing_time
         
-        log("✨", f"Task {task_id} processed in {processing_time:.3f}s", "INFO")
+        log("", f"Task {task_id} processed in {processing_time:.3f}s", "INFO")
         return result
         
     except Exception as e:
         processing_time = time.time() - start_time
-        log("💥", f"Task {task_id} failed: {str(e)}", "ERROR")
+        log("", f"Task {task_id} failed: {str(e)}", "ERROR")
         import traceback
-        log("  ", f"└─ {traceback.format_exc()}", "ERROR")
+        log("  ", f" {traceback.format_exc()}", "ERROR")
         return {
             "task_id": task_id,
             "node_id": NODE_ID,
@@ -363,8 +469,8 @@ def process_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def main_loop():
     """Main event loop"""
-    log("🚀", f"Starting node {NODE_ID}", "INFO")
-    log("🌐", f"Connecting to server: {SERVER_URL}", "INFO")
+    log("", f"Starting node {NODE_ID}", "INFO")
+    log("", f"Connecting to server: {SERVER_URL}", "INFO")
     
     last_heartbeat = 0
     last_stats = 0
@@ -391,7 +497,7 @@ def main_loop():
             task = fetch_task()
             
             if task:
-                log("🎯", f"Starting work on {task.get('task_id')}", "INFO")
+                log("", f"Starting work on {task.get('task_id')}", "INFO")
                 
                 # Process task
                 result = process_task(task)
@@ -401,28 +507,28 @@ def main_loop():
                     success = send_task_result(result)
                     
                     if success:
-                        log("🎉", f"Task {task.get('task_id')} completed successfully!", "INFO")
+                        log("", f"Task {task.get('task_id')} completed successfully!", "INFO")
                     else:
-                        log("😞", f"Failed to report completion of {task.get('task_id')}", "ERROR")
+                        log("", f"Failed to report completion of {task.get('task_id')}", "ERROR")
                 else:
-                    log("⚠️", f"Task {task.get('task_id')} produced no result", "WARN")
+                    log("", f"Task {task.get('task_id')} produced no result", "WARN")
             
             # Wait before next poll
             time.sleep(TASK_POLL_INTERVAL)
             
         except KeyboardInterrupt:
-            log("👋", "Shutting down gracefully...", "INFO")
+            log("", "Shutting down gracefully...", "INFO")
             stats.print_stats()
             break
         except Exception as e:
-            log("💥", f"Unexpected error in main loop: {str(e)}", "ERROR")
+            log("", f"Unexpected error in main loop: {str(e)}", "ERROR")
             time.sleep(5)  # Wait a bit before continuing
 
 
 if __name__ == "__main__":
     # Print startup banner
     print("\n" + "="*60)
-    print("🤖 DISTRIBUTED EDGE NODE")
+    print(" DISTRIBUTED EDGE NODE")
     print("="*60)
     print(f"Node ID: {NODE_ID}")
     print(f"Server: {SERVER_URL}")
@@ -435,5 +541,5 @@ if __name__ == "__main__":
     try:
         main_loop()
     except Exception as e:
-        log("💀", f"Fatal error: {str(e)}", "CRITICAL")
+        log("", f"Fatal error: {str(e)}", "CRITICAL")
         stats.print_stats()

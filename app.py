@@ -39,6 +39,7 @@ AVIATIONSTACK_MIN_FETCH_SECONDS = 300
 DEFAULT_OCCUPANCY_SECONDS = 75
 NODE_TIMEOUT_SECONDS = 30  # Consider node dead if no heartbeat for 30s
 TASK_TIMEOUT_SECONDS = 60  # Task considered stale if not completed in 60s
+WORKING_GRACE_SECONDS = 5  # Keep node in WORKING briefly after activity
 
 # -----------------------------
 # Logging
@@ -77,12 +78,14 @@ class Task:
     completed_at: Optional[datetime]
     window_minutes: int
     result: Optional[Dict[str, Any]] = None
+    task_data: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class NodeInfo:
     node_id: str
     last_heartbeat: datetime
+    last_active_at: datetime
     status: str  # "alive", "dead", "idle", "working"
     tasks_assigned: int
     tasks_completed: int
@@ -154,14 +157,14 @@ class DistributedTaskManager:
             if density > 30:
                 reasons.append("High traffic density (>30/hr)")
             elif density > 15:
-                reasons.append("Moderate traffic density (15–30/hr)")
+                reasons.append("Moderate traffic density (1530/hr)")
             else:
                 reasons.append("Low traffic density (<=15/hr)")
         if occupancy is not None:
             if occupancy > 70:
                 reasons.append("High runway occupancy (>70%)")
             elif occupancy > 40:
-                reasons.append("Moderate runway occupancy (40–70%)")
+                reasons.append("Moderate runway occupancy (4070%)")
             else:
                 reasons.append("Low runway occupancy (<=40%)")
         if min_spacing is not None and min_spacing > 0:
@@ -234,13 +237,14 @@ class DistributedTaskManager:
                 self._nodes[node_id] = NodeInfo(
                     node_id=node_id,
                     last_heartbeat=now,
+                    last_active_at=now,
                     status="alive",
                     tasks_assigned=0,
                     tasks_completed=0,
                     tasks_failed=0,
                     current_task=None
                 )
-                logger.info(f"✅ New node registered: {node_id}")
+                logger.info(f" New node registered: {node_id}")
             else:
                 self._nodes[node_id].last_heartbeat = now
                 # Update status based on heartbeat
@@ -265,13 +269,14 @@ class DistributedTaskManager:
                 assigned_at=None,
                 completed_at=None,
                 window_minutes=window_minutes,
-                result={"task_data": data} if data else None  # Store task data here
+                result=None,
+                task_data=data
             )
             
             self._tasks[task_id] = task
             self._task_queue.append(task_id)
             
-            logger.info(f"📋 Task created: {task_id} (type: {task_type})")
+            logger.info(f" Task created: {task_id} (type: {task_type})")
             return task_id
     
     def get_next_task(self, node_id: str) -> Optional[Dict[str, Any]]:
@@ -294,8 +299,9 @@ class DistributedTaskManager:
                 self._nodes[node_id].tasks_assigned += 1
                 self._nodes[node_id].current_task = task_id
                 self._nodes[node_id].status = "working"
+                self._nodes[node_id].last_active_at = now
             
-            logger.info(f"🎯 Task {task_id} assigned to {node_id}")
+            logger.info(f" Task {task_id} assigned to {node_id}")
             
             # Include task data in response
             task_payload = {
@@ -307,8 +313,8 @@ class DistributedTaskManager:
             }
             
             # Add task-specific data if available
-            if task.result and "task_data" in task.result:
-                task_payload["data"] = task.result["task_data"]
+            if task.task_data:
+                task_payload["data"] = task.task_data
             
             return task_payload
     
@@ -316,7 +322,7 @@ class DistributedTaskManager:
         """Mark task as completed"""
         with self._lock:
             if task_id not in self._tasks:
-                logger.warning(f"⚠️ Unknown task completion: {task_id}")
+                logger.warning(f" Unknown task completion: {task_id}")
                 return
             
             task = self._tasks[task_id]
@@ -335,9 +341,10 @@ class DistributedTaskManager:
                 self._nodes[node_id].tasks_completed += 1
                 self._nodes[node_id].current_task = None
                 self._nodes[node_id].status = "idle"
+                self._nodes[node_id].last_active_at = now
             
             duration = (now - task.assigned_at).total_seconds() if task.assigned_at else 0
-            logger.info(f"✅ Task {task_id} completed by {node_id} in {duration:.1f}s")
+            logger.info(f" Task {task_id} completed by {node_id} in {duration:.1f}s")
     
     def fail_task(self, task_id: str, node_id: str, reason: str) -> None:
         """Mark task as failed"""
@@ -356,8 +363,9 @@ class DistributedTaskManager:
                 self._nodes[node_id].tasks_failed += 1
                 self._nodes[node_id].current_task = None
                 self._nodes[node_id].status = "idle"
+                self._nodes[node_id].last_active_at = now
             
-            logger.warning(f"❌ Task {task_id} failed on {node_id}: {reason}")
+            logger.warning(f" Task {task_id} failed on {node_id}: {reason}")
     
     def check_timeouts(self) -> None:
         """Check for timed out tasks and dead nodes"""
@@ -369,20 +377,20 @@ class DistributedTaskManager:
                 if (now - node.last_heartbeat).total_seconds() > NODE_TIMEOUT_SECONDS:
                     if node.status != "dead":
                         node.status = "dead"
-                        logger.warning(f"💀 Node {node_id} marked as dead (no heartbeat)")
+                        logger.warning(f" Node {node_id} marked as dead (no heartbeat)")
             
             # Check for timed out tasks
             for task_id, task in self._tasks.items():
                 if task.status == TaskStatus.ASSIGNED and task.assigned_at:
                     if (now - task.assigned_at).total_seconds() > TASK_TIMEOUT_SECONDS:
                         task.status = TaskStatus.TIMEOUT
-                        logger.warning(f"⏰ Task {task_id} timed out on {task.node_id}")
+                        logger.warning(f" Task {task_id} timed out on {task.node_id}")
                         # Re-queue the task
                         task.status = TaskStatus.PENDING
                         task.node_id = None
                         task.assigned_at = None
                         self._task_queue.append(task_id)
-                        logger.info(f"🔄 Task {task_id} re-queued after timeout")
+                        logger.info(f" Task {task_id} re-queued after timeout")
     
     def get_status(self) -> Dict[str, Any]:
         """Get comprehensive system status"""
@@ -393,12 +401,21 @@ class DistributedTaskManager:
                 if t.status == TaskStatus.COMPLETED and t.result:
                     latest_completed_from_tasks = t.result
                     break
+
+            # Map currently assigned tasks to nodes for accurate working status
+            assigned_by_node: Dict[str, str] = {}
+            for t in self._tasks.values():
+                if t.status == TaskStatus.ASSIGNED and t.node_id:
+                    assigned_by_node[t.node_id] = t.task_id
             
             # Node statistics (derive status from heartbeat + current_task for accuracy)
             for n in self._nodes.values():
                 if (now - n.last_heartbeat).total_seconds() > NODE_TIMEOUT_SECONDS:
                     n.status = "dead"
-                elif n.current_task is not None:
+                elif n.node_id in assigned_by_node:
+                    n.current_task = assigned_by_node[n.node_id]
+                    n.status = "working"
+                elif (now - n.last_active_at).total_seconds() <= WORKING_GRACE_SECONDS:
                     n.status = "working"
                 else:
                     n.status = "idle"
@@ -422,6 +439,8 @@ class DistributedTaskManager:
             return {
                 "timestamp": now.isoformat(),
                 "server_file": __file__,
+                "node_timeout_seconds": NODE_TIMEOUT_SECONDS,
+                "working_grace_seconds": WORKING_GRACE_SECONDS,
                 "nodes": {
                     "total": len(self._nodes),
                     "alive": len(alive_nodes),
@@ -432,7 +451,9 @@ class DistributedTaskManager:
                             "node_id": n.node_id,
                             "status": n.status,
                             "last_heartbeat": n.last_heartbeat.isoformat(),
+                            "last_active_at": n.last_active_at.isoformat(),
                             "seconds_since_heartbeat": (now - n.last_heartbeat).total_seconds(),
+                            "seconds_since_activity": (now - n.last_active_at).total_seconds(),
                             "tasks_assigned": n.tasks_assigned,
                             "tasks_completed": n.tasks_completed,
                             "tasks_failed": n.tasks_failed,
@@ -460,7 +481,39 @@ class DistributedTaskManager:
                             "duration_seconds": (
                                 (t.completed_at - t.assigned_at).total_seconds()
                                 if t.completed_at and t.assigned_at else None
-                            )
+                            ),
+                            "window_minutes": t.window_minutes,
+                            "task_data_summary": {
+                                "traffic_movements": len(t.task_data.get("traffic_movements", [])) if t.task_data else None,
+                                "window_start": t.task_data.get("window_start") if t.task_data else None,
+                                "window_end": t.task_data.get("window_end") if t.task_data else None,
+                                "airport_code": t.task_data.get("airport_code") if t.task_data else None,
+                                "runway": t.task_data.get("runway") if t.task_data else None,
+                            },
+                            "result_summary": (
+                                {
+                                    "congestion_level": (
+                                        t.result.get("result", t.result).get("congestion_level")
+                                        if t.result else None
+                                    ),
+                                    "congestion_score": (
+                                        t.result.get("result", t.result).get("congestion_score")
+                                        if t.result else None
+                                    ),
+                                    "total_movements": (
+                                        t.result.get("result", t.result).get("total_movements")
+                                        if t.result else None
+                                    ),
+                                    "traffic_density": (
+                                        t.result.get("result", t.result).get("traffic_density")
+                                        if t.result else None
+                                    ),
+                                    "runway_occupancy_percent": (
+                                        t.result.get("result", t.result).get("runway_occupancy_percent")
+                                        if t.result else None
+                                    ),
+                                } if t.result else None
+                            ),
                         }
                         for t in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True)[:20]
                     ]
@@ -706,7 +759,7 @@ class CongestionEngine:
                 for _ in range(TASKS_PER_CYCLE):
                     self.task_manager.create_task("compute_congestion", WINDOW_MINUTES, task_data)
             else:
-                logger.warning("⚠️ No traffic data in window; skipping task creation this cycle")
+                logger.warning(" No traffic data in window; skipping task creation this cycle")
             
             # Check for timeouts
             self.task_manager.check_timeouts()
@@ -734,14 +787,14 @@ engine = CongestionEngine(DATA_FILE, store, task_manager)
 
 @app.on_event("startup")
 def on_startup() -> None:
-    logger.info("📂 Server file: %s", __file__)
+    logger.info(" Server file: %s", __file__)
     engine._ensure_recent_data()
     now = datetime.now(timezone.utc)
     rows = engine.loader.load()
     summary = engine.calculator.compute(rows, WINDOW_MINUTES, now)
     store.set(summary)
     engine.start()
-    logger.info("🚀 Server started - distributed task system online")
+    logger.info(" Server started - distributed task system online")
 
 
 @app.get("/")
@@ -838,10 +891,10 @@ def dashboard():
         </style>
     </head>
     <body>
-        <div class="auto-refresh">● Auto-refreshing</div>
+        <div class="auto-refresh"> Auto-refreshing</div>
         
         <div class="header">
-            <h1>🛫 VABB Distributed Task Monitor</h1>
+            <h1> VABB Distributed Task Monitor</h1>
             <div class="subtitle">Real-time task distribution between Mac & Phone nodes</div>
         </div>
 
@@ -860,13 +913,16 @@ def dashboard():
                 const latestMetrics = data.latest_metrics;
                 const xai = data.xai;
                 const forecast = data.forecast;
+                const ml = latestMetrics ? latestMetrics.ml : null;
                 const serverFile = data.server_file;
                 const latestPresent = data.latest_result_present;
+                const timeoutSeconds = data.node_timeout_seconds ?? 30;
+                const graceSeconds = data.working_grace_seconds ?? 5;
                 
                 const html = `
                     <div class="grid">
                         <div class="card">
-                            <h2>📊 System Overview</h2>
+                            <h2> System Overview</h2>
                             <div class="stat">
                                 <span class="stat-label">Total Nodes</span>
                                 <span class="stat-value">${nodes.total}</span>
@@ -886,7 +942,7 @@ def dashboard():
                         </div>
 
                         <div class="card">
-                            <h2>📋 Task Statistics</h2>
+                            <h2> Task Statistics</h2>
                             <div class="stat">
                                 <span class="stat-label">Total Tasks</span>
                                 <span class="stat-value">${tasks.total}</span>
@@ -916,7 +972,7 @@ def dashboard():
 
                     <div class="grid">
                         <div class="card">
-                            <h2>🧮 Latest Phone Calculations</h2>
+                            <h2> Latest Phone Calculations</h2>
                             ${latestMetrics ? `
                                 <div class="stat">
                                     <span class="stat-label">Congestion</span>
@@ -950,7 +1006,7 @@ def dashboard():
                             `}
                         </div>
                         <div class="card">
-                            <h2>🔎 XAI: Why This Result</h2>
+                            <h2> XAI: Why This Result</h2>
                             ${xai ? `
                                 <div class="stat">
                                     <span class="stat-label">Level / Score</span>
@@ -970,7 +1026,38 @@ def dashboard():
                             `}
                         </div>
                         <div class="card">
-                            <h2>🔮 Forecast: Next Window</h2>
+                            <h2> ML Findings</h2>
+                            ${ml ? `
+                                <div class="stat">
+                                    <span class="stat-label">Method</span>
+                                    <span class="stat-value">${ml.method} (${ml.samples} samples, ${ml.bin_minutes}m bins)</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Predicted Congestion</span>
+                                    <span class="stat-value">${ml.predicted_congestion_level?.toUpperCase?.() || ml.predicted_congestion_level}</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Predicted Density</span>
+                                    <span class="stat-value">${ml.predicted_traffic_density_per_hr} /hr</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Predicted Occupancy</span>
+                                    <span class="stat-value">${ml.predicted_runway_occupancy_percent}%</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Trend (density/bin)</span>
+                                    <span class="stat-value">${ml.trend_density_per_bin}</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Trend (occupancy/bin)</span>
+                                    <span class="stat-value">${ml.trend_occupancy_percent_per_bin}%</span>
+                                </div>
+                            ` : `
+                                <div style="color: #94a3b8;">ML findings not available yet.</div>
+                            `}
+                        </div>
+                        <div class="card">
+                            <h2> Forecast: Next Window</h2>
                             ${forecast ? `
                                 <div class="stat">
                                     <span class="stat-label">Method</span>
@@ -1000,28 +1087,34 @@ def dashboard():
 
                     <div class="grid">
                         <div class="card">
-                            <h2>🖥️ Active Nodes</h2>
-                            ${nodes.details.map(node => `
+                            <h2> Active Nodes</h2>
+                            ${nodes.details.map(node => {
+                                const derivedStatus = (node.seconds_since_heartbeat > timeoutSeconds)
+                                    ? 'dead'
+                                    : (node.current_task || (node.seconds_since_activity <= graceSeconds))
+                                        ? 'working'
+                                        : 'idle';
+                                return `
                                 <div class="node-item">
                                     <div>
                                         <strong>${node.node_id}</strong>
-                                        <span class="status-${node.status}"> ● ${node.status.toUpperCase()}</span>
+                                        <span class="status-${derivedStatus}">  ${derivedStatus.toUpperCase()}</span>
                                     </div>
                                     <div class="timestamp">
-                                        Last heartbeat: ${Math.round(node.seconds_since_heartbeat)}s ago
+                                        Last heartbeat: ${Math.round(node.seconds_since_heartbeat)}s ago | Last activity: ${Math.round(node.seconds_since_activity)}s ago
                                     </div>
                                     <div style="margin-top: 8px;">
                                         <span style="color: #64748b;">Tasks:</span>
-                                        <span style="color: #10b981;">✓${node.tasks_completed}</span>
-                                        <span style="color: #ef4444;">✗${node.tasks_failed}</span>
-                                        ${node.current_task ? `<span style="color: #3b82f6;">⚙️ ${node.current_task}</span>` : ''}
+                                        <span style="color: #10b981;">${node.tasks_completed}</span>
+                                        <span style="color: #ef4444;">${node.tasks_failed}</span>
+                                        ${node.current_task ? `<span style="color: #3b82f6;"> ${node.current_task}</span>` : ''}
                                     </div>
                                 </div>
-                            `).join('')}
+                            `}).join('')}
                         </div>
 
                         <div class="card">
-                            <h2>⚡ Recent Tasks</h2>
+                            <h2> Recent Tasks</h2>
                             ${tasks.recent_tasks.slice(0, 10).map(task => `
                                 <div class="task-item">
                                     <div>
@@ -1029,9 +1122,22 @@ def dashboard():
                                         <span class="status-${task.status}"> ${task.status.toUpperCase()}</span>
                                     </div>
                                     <div style="margin-top: 5px; color: #94a3b8;">
+                                        Type: ${task.type} | Window: ${task.window_minutes}m
+                                    </div>
+                                    <div style="margin-top: 5px; color: #94a3b8;">
                                         Node: ${task.node_id || 'unassigned'}
                                         ${task.duration_seconds ? ` | Duration: ${task.duration_seconds.toFixed(1)}s` : ''}
                                     </div>
+                                    ${task.task_data_summary && task.task_data_summary.traffic_movements !== null ? `
+                                        <div style="margin-top: 5px; color: #94a3b8;">
+                                            Data: ${task.task_data_summary.traffic_movements} movements | ${task.task_data_summary.airport_code || 'N/A'} ${task.task_data_summary.runway || ''}
+                                        </div>
+                                    ` : ''}
+                                    ${task.result_summary && task.result_summary.congestion_level ? `
+                                        <div style="margin-top: 5px; color: #94a3b8;">
+                                            Result: ${task.result_summary.congestion_level.toUpperCase()} (${task.result_summary.congestion_score}/10), Density ${task.result_summary.traffic_density}/hr, Occupancy ${task.result_summary.runway_occupancy_percent}%
+                                        </div>
+                                    ` : ''}
                                     <div class="timestamp">
                                         Created: ${new Date(task.created_at).toLocaleTimeString()}
                                     </div>
@@ -1095,7 +1201,7 @@ def task_result(result: Dict[str, Any]):
     task_id = result.get("task_id")
     node_id = result.get("node_id")
     logger.info(
-        "📥 Task result received: task_id=%s node_id=%s status=%s keys=%s",
+        " Task result received: task_id=%s node_id=%s status=%s keys=%s",
         task_id,
         node_id,
         result.get("status"),
