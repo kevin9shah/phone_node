@@ -525,8 +525,9 @@ class CongestionEngine:
             return
 
         now = datetime.now(timezone.utc)
-        recent_rows = [r for r in rows if r.timestamp_utc >= now - timedelta(hours=24)]
-        if not recent_rows:
+        # Ensure we have data within the active window, not just "last 24h".
+        window_rows = [r for r in rows if r.timestamp_utc >= now - timedelta(minutes=WINDOW_MINUTES)]
+        if not window_rows:
             self.generator.generate()
 
     def _cycle(self) -> None:
@@ -540,28 +541,36 @@ class CongestionEngine:
             # Prepare traffic data for analysis task
             window_start = now - timedelta(minutes=WINDOW_MINUTES)
             recent_rows = [r for r in rows if r.timestamp_utc >= window_start]
+            if not recent_rows:
+                # Regenerate once if the file is stale for the active window.
+                self.generator.generate()
+                rows = self.loader.load()
+                recent_rows = [r for r in rows if r.timestamp_utc >= window_start]
             
-            # Convert traffic rows to serializable format
-            traffic_data = [
-                {
-                    "timestamp_utc": r.timestamp_utc.isoformat(),
-                    "movement_type": r.movement_type,
-                    "runway": r.runway,
-                    "occupancy_seconds": r.occupancy_seconds
+            if recent_rows:
+                # Convert traffic rows to serializable format
+                traffic_data = [
+                    {
+                        "timestamp_utc": r.timestamp_utc.isoformat(),
+                        "movement_type": r.movement_type,
+                        "runway": r.runway,
+                        "occupancy_seconds": r.occupancy_seconds
+                    }
+                    for r in recent_rows
+                ]
+                
+                # Generate task with real traffic data
+                task_data = {
+                    "traffic_movements": traffic_data,
+                    "window_start": window_start.isoformat(),
+                    "window_end": now.isoformat(),
+                    "airport_code": AIRPORT_CODE,
+                    "runway": RUNWAY
                 }
-                for r in recent_rows
-            ]
-            
-            # Generate task with real traffic data
-            task_data = {
-                "traffic_movements": traffic_data,
-                "window_start": window_start.isoformat(),
-                "window_end": now.isoformat(),
-                "airport_code": AIRPORT_CODE,
-                "runway": RUNWAY
-            }
-            
-            self.task_manager.create_task("compute_congestion", WINDOW_MINUTES, task_data)
+                
+                self.task_manager.create_task("compute_congestion", WINDOW_MINUTES, task_data)
+            else:
+                logger.warning("⚠️ No traffic data in window; skipping task creation this cycle")
             
             # Check for timeouts
             self.task_manager.check_timeouts()
