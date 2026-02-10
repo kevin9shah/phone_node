@@ -122,6 +122,109 @@ class DistributedTaskManager:
         self._task_queue: deque = deque()
         self._task_counter = 0
         self._latest_result: Optional[Dict[str, Any]] = None
+        self._history: deque = deque(maxlen=50)
+
+    def _extract_metrics(self, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not result:
+            return None
+        # Accept both schemas: nested "result" or flat metrics.
+        if "result" in result and isinstance(result["result"], dict):
+            return result["result"]
+        return result
+
+    def _classify_congestion(self, density: float, occupancy: float) -> str:
+        if density > 30 or occupancy > 70:
+            return "high"
+        if density > 15 or occupancy > 40:
+            return "medium"
+        return "low"
+
+    def _build_xai(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        density = metrics.get("traffic_density")
+        occupancy = metrics.get("runway_occupancy_percent")
+        min_spacing = metrics.get("min_spacing_minutes")
+        arrivals = metrics.get("arrivals")
+        departures = metrics.get("departures")
+        total = metrics.get("total_movements")
+        congestion_score = metrics.get("congestion_score")
+        congestion_level = metrics.get("congestion_level")
+
+        reasons = []
+        if density is not None:
+            if density > 30:
+                reasons.append("High traffic density (>30/hr)")
+            elif density > 15:
+                reasons.append("Moderate traffic density (15–30/hr)")
+            else:
+                reasons.append("Low traffic density (<=15/hr)")
+        if occupancy is not None:
+            if occupancy > 70:
+                reasons.append("High runway occupancy (>70%)")
+            elif occupancy > 40:
+                reasons.append("Moderate runway occupancy (40–70%)")
+            else:
+                reasons.append("Low runway occupancy (<=40%)")
+        if min_spacing is not None and min_spacing > 0:
+            if min_spacing < 3.0:
+                reasons.append("Tight spacing (<3 min) increases score")
+            else:
+                reasons.append("Spacing acceptable (>=3 min)")
+
+        imbalance = None
+        if total and arrivals is not None and departures is not None and total > 0:
+            arrival_pct = (arrivals / total) * 100
+            imbalance = abs(arrival_pct - 50.0)
+            if imbalance > 30:
+                reasons.append("High arrival/departure imbalance (>30%)")
+
+        return {
+            "congestion_level": congestion_level,
+            "congestion_score": congestion_score,
+            "reasons": reasons,
+            "signals": {
+                "traffic_density_per_hr": density,
+                "runway_occupancy_percent": occupancy,
+                "min_spacing_minutes": min_spacing,
+                "arrival_departure_imbalance_pct": round(imbalance, 1) if imbalance is not None else None,
+            },
+            "thresholds": {
+                "density_high": 30,
+                "density_medium": 15,
+                "occupancy_high_percent": 70,
+                "occupancy_medium_percent": 40,
+                "spacing_penalty_minutes": 3.0,
+            },
+        }
+
+    def _build_forecast(self) -> Optional[Dict[str, Any]]:
+        if not self._history:
+            return None
+        # Use last N points for a simple moving average forecast.
+        window = list(self._history)[-5:]
+        def avg(key: str) -> Optional[float]:
+            vals = [m.get(key) for m in window if m.get(key) is not None]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        density = avg("traffic_density")
+        occupancy = avg("runway_occupancy_percent")
+        arrivals = avg("arrivals")
+        departures = avg("departures")
+        score = avg("congestion_score")
+
+        predicted_level = None
+        if density is not None and occupancy is not None:
+            predicted_level = self._classify_congestion(density, occupancy)
+
+        return {
+            "method": "moving_average",
+            "window_points": len(window),
+            "predicted_congestion_level": predicted_level,
+            "predicted_congestion_score": score,
+            "predicted_traffic_density_per_hr": density,
+            "predicted_runway_occupancy_percent": occupancy,
+            "predicted_arrivals": arrivals,
+            "predicted_departures": departures,
+        }
         
     def register_node(self, node_id: str) -> None:
         """Register or update node heartbeat"""
@@ -223,6 +326,9 @@ class DistributedTaskManager:
             task.completed_at = now
             task.result = result
             self._latest_result = result
+            metrics = self._extract_metrics(result)
+            if metrics:
+                self._history.append(metrics)
             
             # Update node
             if node_id in self._nodes:
@@ -282,6 +388,11 @@ class DistributedTaskManager:
         """Get comprehensive system status"""
         with self._lock:
             now = datetime.now(timezone.utc)
+            latest_completed_from_tasks = None
+            for t in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True):
+                if t.status == TaskStatus.COMPLETED and t.result:
+                    latest_completed_from_tasks = t.result
+                    break
             
             # Node statistics
             alive_nodes = [n for n in self._nodes.values() if n.status in ["alive", "idle", "working"]]
@@ -294,8 +405,15 @@ class DistributedTaskManager:
             completed_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.COMPLETED]
             failed_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.FAILED]
             
+            xai = None
+            latest_metrics = self._extract_metrics(self._latest_result) if self._latest_result else None
+            if latest_metrics:
+                xai = self._build_xai(latest_metrics)
+            forecast = self._build_forecast()
+
             return {
                 "timestamp": now.isoformat(),
+                "server_file": __file__,
                 "nodes": {
                     "total": len(self._nodes),
                     "alive": len(alive_nodes),
@@ -339,7 +457,12 @@ class DistributedTaskManager:
                         for t in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True)[:20]
                     ]
                 },
-                "latest_result": self._latest_result
+                "latest_result": self._latest_result,
+                "latest_result_from_tasks": latest_completed_from_tasks,
+                "latest_result_present": self._latest_result is not None,
+                "latest_metrics": latest_metrics,
+                "xai": xai,
+                "forecast": forecast
             }
 
 
@@ -603,6 +726,7 @@ engine = CongestionEngine(DATA_FILE, store, task_manager)
 
 @app.on_event("startup")
 def on_startup() -> None:
+    logger.info("📂 Server file: %s", __file__)
     engine._ensure_recent_data()
     now = datetime.now(timezone.utc)
     rows = engine.loader.load()
@@ -725,8 +849,11 @@ def dashboard():
             function renderStatus(data) {
                 const nodes = data.nodes;
                 const tasks = data.tasks;
-                const latest = tasks.latest_result;
-                const latestMetrics = latest ? (latest.result ? latest.result : latest) : null;
+                const latestMetrics = data.latest_metrics;
+                const xai = data.xai;
+                const forecast = data.forecast;
+                const serverFile = data.server_file;
+                const latestPresent = data.latest_result_present;
                 
                 const html = `
                     <div class="grid">
@@ -815,11 +942,50 @@ def dashboard():
                             `}
                         </div>
                         <div class="card">
-                            <h2>🪲 Debug: Raw Latest Result</h2>
-                            ${latest ? `
-                                <pre style="white-space: pre-wrap; color: #94a3b8; font-size: 0.9em;">${JSON.stringify(latest, null, 2)}</pre>
+                            <h2>🔎 XAI: Why This Result</h2>
+                            ${xai ? `
+                                <div class="stat">
+                                    <span class="stat-label">Level / Score</span>
+                                    <span class="stat-value">${xai.congestion_level?.toUpperCase?.() || xai.congestion_level} (${xai.congestion_score}/10)</span>
+                                </div>
+                                ${xai.reasons.map(r => `
+                                    <div class="stat">
+                                        <span class="stat-label">Reason</span>
+                                        <span class="stat-value">${r}</span>
+                                    </div>
+                                `).join('')}
+                                <div class="timestamp" style="margin-top: 8px;">
+                                    Signals: density ${xai.signals.traffic_density_per_hr}/hr, occupancy ${xai.signals.runway_occupancy_percent}%, min spacing ${xai.signals.min_spacing_minutes}m
+                                </div>
                             ` : `
-                                <div style="color: #94a3b8;">No latest_result in /status.</div>
+                                <div style="color: #94a3b8;">XAI not available yet.</div>
+                            `}
+                        </div>
+                        <div class="card">
+                            <h2>🔮 Forecast: Next Window</h2>
+                            ${forecast ? `
+                                <div class="stat">
+                                    <span class="stat-label">Method</span>
+                                    <span class="stat-value">${forecast.method} (last ${forecast.window_points})</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Congestion</span>
+                                    <span class="stat-value">${forecast.predicted_congestion_level?.toUpperCase?.() || forecast.predicted_congestion_level} (${forecast.predicted_congestion_score})</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Density</span>
+                                    <span class="stat-value">${forecast.predicted_traffic_density_per_hr} /hr</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Occupancy</span>
+                                    <span class="stat-value">${forecast.predicted_runway_occupancy_percent}%</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Arrivals / Departures</span>
+                                    <span class="stat-value">${forecast.predicted_arrivals} / ${forecast.predicted_departures}</span>
+                                </div>
+                            ` : `
+                                <div style="color: #94a3b8;">Forecast not available yet.</div>
                             `}
                         </div>
                     </div>
@@ -920,7 +1086,13 @@ def task_result(result: Dict[str, Any]):
     """Receive task result from node"""
     task_id = result.get("task_id")
     node_id = result.get("node_id")
-    logger.info("📥 Task result received: task_id=%s node_id=%s status=%s", task_id, node_id, result.get("status"))
+    logger.info(
+        "📥 Task result received: task_id=%s node_id=%s status=%s keys=%s",
+        task_id,
+        node_id,
+        result.get("status"),
+        list(result.keys()),
+    )
     
     if not task_id or not node_id:
         raise HTTPException(status_code=400, detail="Missing task_id or node_id")
