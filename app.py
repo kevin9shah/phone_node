@@ -1,8 +1,6 @@
 """
-VABB primary node - FastAPI server
-- Loads runway traffic data from CSV (or generates if stale/missing)
-- Computes simple congestion metrics
-- Exposes REST endpoints for summary and edge feedback
+VABB primary node - FastAPI server with transparent task distribution
+Enhanced with: task tracking, node monitoring, real-time dashboard
 """
 
 from __future__ import annotations
@@ -13,32 +11,33 @@ import os
 import random
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from enum import Enum
+from collections import deque, defaultdict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 import requests
-from collections import deque
 
 # -----------------------------
 # Configuration
 # -----------------------------
 DATA_FILE = Path(__file__).with_name("sample_runway_data.csv")
 WINDOW_MINUTES = 60
-CYCLE_SECONDS = 45  # run every 30-60 seconds
+CYCLE_SECONDS = 45
 AIRPORT_CODE = "VABB"
 AIRPORT_IATA = "BOM"
 RUNWAY = "09/27"
 AVIATIONSTACK_ACCESS_KEY = os.getenv("AVIATIONSTACK_ACCESS_KEY")
 AVIATIONSTACK_BASE_URL = "https://api.aviationstack.com/v1/flights"
-# Free tiers can be tight; fetch less often and reuse cached API results
 AVIATIONSTACK_MIN_FETCH_SECONDS = 300
 DEFAULT_OCCUPANCY_SECONDS = 75
-# Task queues per node
-TASKS: Dict[str, deque] = {}
+NODE_TIMEOUT_SECONDS = 30  # Consider node dead if no heartbeat for 30s
+TASK_TIMEOUT_SECONDS = 60  # Task considered stale if not completed in 60s
 
 # -----------------------------
 # Logging
@@ -55,6 +54,42 @@ logging.basicConfig(
 logger = logging.getLogger("vabb-node")
 
 # -----------------------------
+# Task Status Tracking
+# -----------------------------
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    ASSIGNED = "assigned"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+
+
+@dataclass
+class Task:
+    task_id: str
+    type: str
+    node_id: Optional[str]
+    status: TaskStatus
+    created_at: datetime
+    assigned_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    window_minutes: int
+    result: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class NodeInfo:
+    node_id: str
+    last_heartbeat: datetime
+    status: str  # "alive", "dead", "idle", "working"
+    tasks_assigned: int
+    tasks_completed: int
+    tasks_failed: int
+    current_task: Optional[str]
+
+
+# -----------------------------
 # Data Models
 # -----------------------------
 class EdgeFeedback(BaseModel):
@@ -68,9 +103,232 @@ class EdgeFeedback(BaseModel):
 @dataclass
 class TrafficRow:
     timestamp_utc: datetime
-    movement_type: str  # arrival or departure
+    movement_type: str
     runway: str
     occupancy_seconds: int
+
+
+# -----------------------------
+# Task and Node Management
+# -----------------------------
+class DistributedTaskManager:
+    """Manages task distribution and node tracking with full transparency"""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tasks: Dict[str, Task] = {}
+        self._nodes: Dict[str, NodeInfo] = {}
+        self._task_queue: deque = deque()
+        self._task_counter = 0
+        
+    def register_node(self, node_id: str) -> None:
+        """Register or update node heartbeat"""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            if node_id not in self._nodes:
+                self._nodes[node_id] = NodeInfo(
+                    node_id=node_id,
+                    last_heartbeat=now,
+                    status="alive",
+                    tasks_assigned=0,
+                    tasks_completed=0,
+                    tasks_failed=0,
+                    current_task=None
+                )
+                logger.info(f"✅ New node registered: {node_id}")
+            else:
+                self._nodes[node_id].last_heartbeat = now
+                # Update status based on heartbeat
+                if self._nodes[node_id].current_task is None:
+                    self._nodes[node_id].status = "idle"
+                else:
+                    self._nodes[node_id].status = "working"
+    
+    def create_task(self, task_type: str, window_minutes: int) -> str:
+        """Create a new task and add to queue"""
+        with self._lock:
+            self._task_counter += 1
+            task_id = f"task-{self._task_counter:05d}"
+            now = datetime.now(timezone.utc)
+            
+            task = Task(
+                task_id=task_id,
+                type=task_type,
+                node_id=None,
+                status=TaskStatus.PENDING,
+                created_at=now,
+                assigned_at=None,
+                completed_at=None,
+                window_minutes=window_minutes
+            )
+            
+            self._tasks[task_id] = task
+            self._task_queue.append(task_id)
+            
+            logger.info(f"📋 Task created: {task_id} (type: {task_type})")
+            return task_id
+    
+    def get_next_task(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Assign next task to requesting node"""
+        with self._lock:
+            if not self._task_queue:
+                return None
+            
+            task_id = self._task_queue.popleft()
+            task = self._tasks[task_id]
+            now = datetime.now(timezone.utc)
+            
+            # Update task
+            task.node_id = node_id
+            task.status = TaskStatus.ASSIGNED
+            task.assigned_at = now
+            
+            # Update node
+            if node_id in self._nodes:
+                self._nodes[node_id].tasks_assigned += 1
+                self._nodes[node_id].current_task = task_id
+                self._nodes[node_id].status = "working"
+            
+            logger.info(f"🎯 Task {task_id} assigned to {node_id}")
+            
+            return {
+                "task_id": task_id,
+                "type": task.type,
+                "window_minutes": task.window_minutes,
+                "assigned_at": task.assigned_at.isoformat(),
+                "node_id": node_id
+            }
+    
+    def complete_task(self, task_id: str, node_id: str, result: Dict[str, Any]) -> None:
+        """Mark task as completed"""
+        with self._lock:
+            if task_id not in self._tasks:
+                logger.warning(f"⚠️ Unknown task completion: {task_id}")
+                return
+            
+            task = self._tasks[task_id]
+            now = datetime.now(timezone.utc)
+            
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = now
+            task.result = result
+            
+            # Update node
+            if node_id in self._nodes:
+                self._nodes[node_id].tasks_completed += 1
+                self._nodes[node_id].current_task = None
+                self._nodes[node_id].status = "idle"
+            
+            duration = (now - task.assigned_at).total_seconds() if task.assigned_at else 0
+            logger.info(f"✅ Task {task_id} completed by {node_id} in {duration:.1f}s")
+    
+    def fail_task(self, task_id: str, node_id: str, reason: str) -> None:
+        """Mark task as failed"""
+        with self._lock:
+            if task_id not in self._tasks:
+                return
+            
+            task = self._tasks[task_id]
+            now = datetime.now(timezone.utc)
+            
+            task.status = TaskStatus.FAILED
+            task.completed_at = now
+            task.result = {"error": reason}
+            
+            if node_id in self._nodes:
+                self._nodes[node_id].tasks_failed += 1
+                self._nodes[node_id].current_task = None
+                self._nodes[node_id].status = "idle"
+            
+            logger.warning(f"❌ Task {task_id} failed on {node_id}: {reason}")
+    
+    def check_timeouts(self) -> None:
+        """Check for timed out tasks and dead nodes"""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            
+            # Check for dead nodes
+            for node_id, node in self._nodes.items():
+                if (now - node.last_heartbeat).total_seconds() > NODE_TIMEOUT_SECONDS:
+                    if node.status != "dead":
+                        node.status = "dead"
+                        logger.warning(f"💀 Node {node_id} marked as dead (no heartbeat)")
+            
+            # Check for timed out tasks
+            for task_id, task in self._tasks.items():
+                if task.status == TaskStatus.ASSIGNED and task.assigned_at:
+                    if (now - task.assigned_at).total_seconds() > TASK_TIMEOUT_SECONDS:
+                        task.status = TaskStatus.TIMEOUT
+                        logger.warning(f"⏰ Task {task_id} timed out on {task.node_id}")
+                        # Re-queue the task
+                        task.status = TaskStatus.PENDING
+                        task.node_id = None
+                        task.assigned_at = None
+                        self._task_queue.append(task_id)
+                        logger.info(f"🔄 Task {task_id} re-queued after timeout")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get comprehensive system status"""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            
+            # Node statistics
+            alive_nodes = [n for n in self._nodes.values() if n.status in ["alive", "idle", "working"]]
+            working_nodes = [n for n in self._nodes.values() if n.status == "working"]
+            dead_nodes = [n for n in self._nodes.values() if n.status == "dead"]
+            
+            # Task statistics
+            pending_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.PENDING]
+            assigned_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.ASSIGNED]
+            completed_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.COMPLETED]
+            failed_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.FAILED]
+            
+            return {
+                "timestamp": now.isoformat(),
+                "nodes": {
+                    "total": len(self._nodes),
+                    "alive": len(alive_nodes),
+                    "working": len(working_nodes),
+                    "dead": len(dead_nodes),
+                    "details": [
+                        {
+                            "node_id": n.node_id,
+                            "status": n.status,
+                            "last_heartbeat": n.last_heartbeat.isoformat(),
+                            "seconds_since_heartbeat": (now - n.last_heartbeat).total_seconds(),
+                            "tasks_assigned": n.tasks_assigned,
+                            "tasks_completed": n.tasks_completed,
+                            "tasks_failed": n.tasks_failed,
+                            "current_task": n.current_task
+                        }
+                        for n in self._nodes.values()
+                    ]
+                },
+                "tasks": {
+                    "total": len(self._tasks),
+                    "pending": len(pending_tasks),
+                    "assigned": len(assigned_tasks),
+                    "completed": len(completed_tasks),
+                    "failed": len(failed_tasks),
+                    "queue_size": len(self._task_queue),
+                    "recent_tasks": [
+                        {
+                            "task_id": t.task_id,
+                            "type": t.type,
+                            "status": t.status.value,
+                            "node_id": t.node_id,
+                            "created_at": t.created_at.isoformat(),
+                            "assigned_at": t.assigned_at.isoformat() if t.assigned_at else None,
+                            "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+                            "duration_seconds": (
+                                (t.completed_at - t.assigned_at).total_seconds()
+                                if t.completed_at and t.assigned_at else None
+                            )
+                        }
+                        for t in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True)[:20]
+                    ]
+                }
+            }
 
 
 # -----------------------------
@@ -81,7 +339,6 @@ class DataLoader:
         self.path = path
 
     def _parse_row(self, row: Dict[str, str]) -> TrafficRow:
-        # Expecting ISO-8601 timestamp in UTC
         ts = datetime.fromisoformat(row["timestamp_utc"]).replace(tzinfo=timezone.utc)
         return TrafficRow(
             timestamp_utc=ts,
@@ -100,14 +357,11 @@ class DataLoader:
                 try:
                     rows.append(self._parse_row(row))
                 except Exception:
-                    # Skip malformed rows, keep it beginner-friendly
                     continue
         return rows
 
 
 class DataGenerator:
-    """Simple simulated data generator for runway movements."""
-
     def __init__(self, path: Path):
         self.path = path
 
@@ -118,8 +372,7 @@ class DataGenerator:
         rows: List[TrafficRow] = []
         current = start
         while current <= now:
-            # Randomly decide if a movement happened at this interval
-            if random.random() < 0.75:  # 75% chance of a movement
+            if random.random() < 0.75:
                 movement_type = "arrival" if random.random() < 0.5 else "departure"
                 occupancy_seconds = random.randint(40, 120)
                 rows.append(
@@ -146,83 +399,6 @@ class DataGenerator:
                         r.occupancy_seconds,
                     ]
                 )
-
-
-# -----------------------------
-# Live Data (Aviationstack)
-# -----------------------------
-class AviationStackClient:
-    """Minimal Aviationstack client for real-time flight data."""
-
-    def __init__(self, access_key: str) -> None:
-        self.access_key = access_key
-
-    def _fetch(self, params: Dict[str, str]) -> List[Dict[str, Any]]:
-        query = {"access_key": self.access_key}
-        query.update(params)
-        resp = requests.get(AVIATIONSTACK_BASE_URL, params=query, timeout=10)
-        resp.raise_for_status()
-        payload = resp.json()
-        return payload.get("data", [])
-
-    def get_recent_movements(
-        self, now: datetime, window_minutes: int
-    ) -> List[TrafficRow]:
-        # Fetch departures and arrivals for the airport using ICAO code
-        flight_date = now.date().isoformat()
-        departures = self._fetch(
-            {
-                "dep_icao": AIRPORT_CODE,
-                "flight_date": flight_date,
-                "limit": "100",
-            }
-        )
-        arrivals = self._fetch(
-            {
-                "arr_icao": AIRPORT_CODE,
-                "flight_date": flight_date,
-                "limit": "100",
-            }
-        )
-
-        rows: List[TrafficRow] = []
-        window_start = now - timedelta(minutes=window_minutes)
-
-        def parse_time(record: Dict[str, Any], key: str) -> Optional[datetime]:
-            data = record.get(key) or {}
-            time_str = data.get("actual") or data.get("estimated") or data.get("scheduled")
-            if not time_str:
-                return None
-            try:
-                return datetime.fromisoformat(time_str).replace(tzinfo=timezone.utc)
-            except Exception:
-                return None
-
-        for flight in departures:
-            ts = parse_time(flight, "departure")
-            if ts and ts >= window_start:
-                rows.append(
-                    TrafficRow(
-                        timestamp_utc=ts,
-                        movement_type="departure",
-                        runway=RUNWAY,
-                        occupancy_seconds=DEFAULT_OCCUPANCY_SECONDS,
-                    )
-                )
-
-        for flight in arrivals:
-            ts = parse_time(flight, "arrival")
-            if ts and ts >= window_start:
-                rows.append(
-                    TrafficRow(
-                        timestamp_utc=ts,
-                        movement_type="arrival",
-                        runway=RUNWAY,
-                        occupancy_seconds=DEFAULT_OCCUPANCY_SECONDS,
-                    )
-                )
-
-        return rows
 
 
 # -----------------------------
@@ -268,7 +444,6 @@ class MetricsCalculator:
         }
 
     def _classify_congestion(self, density: float, occupancy: float) -> str:
-        # Simple rules-based classification
         if density > 30 or occupancy > 0.7:
             return "high"
         if density > 15 or occupancy > 0.4:
@@ -277,7 +452,7 @@ class MetricsCalculator:
 
 
 # -----------------------------
-# Summary Store (thread-safe)
+# Summary Store
 # -----------------------------
 class SummaryStore:
     def __init__(self) -> None:
@@ -294,79 +469,44 @@ class SummaryStore:
 
 
 # -----------------------------
-# Background Cycle
+# Background Tasks
 # -----------------------------
 class CongestionEngine:
-    def __init__(self, data_file: Path, store: SummaryStore):
+    def __init__(self, data_file: Path, store: SummaryStore, task_manager: DistributedTaskManager):
         self.data_file = data_file
         self.store = store
+        self.task_manager = task_manager
         self.loader = DataLoader(data_file)
         self.generator = DataGenerator(data_file)
         self.calculator = MetricsCalculator()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._last_api_fetch: Optional[datetime] = None
-
-        # Use live data if a key is present; otherwise fallback to CSV generation
-        self._api_client: Optional[AviationStackClient] = None
-        if AVIATIONSTACK_ACCESS_KEY:
-            self._api_client = AviationStackClient(AVIATIONSTACK_ACCESS_KEY)
 
     def _ensure_recent_data(self) -> None:
-        if self._api_client:
-            # Live data mode: no CSV regeneration required
-            return
-
         rows = self.loader.load()
         if not rows:
             self.generator.generate()
             return
 
-        # If data is too old, regenerate to keep metrics meaningful
         now = datetime.now(timezone.utc)
         recent_rows = [r for r in rows if r.timestamp_utc >= now - timedelta(hours=24)]
         if not recent_rows:
             self.generator.generate()
 
-    def _load_rows(self, now: datetime) -> List[TrafficRow]:
-        if not self._api_client:
-            return self.loader.load()
-
-        # Throttle API calls to respect free tier limits
-        if self._last_api_fetch and (
-            now - self._last_api_fetch
-        ).total_seconds() < AVIATIONSTACK_MIN_FETCH_SECONDS:
-            # If we can't fetch yet, fall back to last CSV snapshot or empty
-            return self.loader.load()
-
-        rows = self._api_client.get_recent_movements(now, WINDOW_MINUTES)
-        self._last_api_fetch = now
-
-        # Cache to CSV for visibility/debugging
-        with self.data_file.open("w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["timestamp_utc", "movement_type", "runway", "occupancy_seconds"]
-            )
-            for r in rows:
-                writer.writerow(
-                    [
-                        r.timestamp_utc.isoformat(),
-                        r.movement_type,
-                        r.runway,
-                        r.occupancy_seconds,
-                    ]
-                )
-
-        return rows
-
     def _cycle(self) -> None:
         while not self._stop_event.is_set():
             self._ensure_recent_data()
             now = datetime.now(timezone.utc)
-            rows = self._load_rows(now)
+            rows = self.loader.load()
             summary = self.calculator.compute(rows, WINDOW_MINUTES, now)
             self.store.set(summary)
+            
+            # Generate tasks periodically
+            self.task_manager.create_task("compute_congestion", WINDOW_MINUTES)
+            
+            # Check for timeouts
+            self.task_manager.check_timeouts()
+            
             time.sleep(CYCLE_SECONDS)
 
     def start(self) -> None:
@@ -382,45 +522,300 @@ class CongestionEngine:
 # -----------------------------
 # FastAPI App
 # -----------------------------
-app = FastAPI(title="VABB Primary Node")
+app = FastAPI(title="VABB Primary Node - Distributed Task System")
 store = SummaryStore()
-engine = CongestionEngine(DATA_FILE, store)
+task_manager = DistributedTaskManager()
+engine = CongestionEngine(DATA_FILE, store, task_manager)
 
-def generate_tasks_for_node(node_id: str):
-    """Simulate tasks for a node."""
-    if node_id not in TASKS:
-        TASKS[node_id] = deque()
-    
-    # Example tasks: compute congestion for the last hour
-    TASKS[node_id].append({
-        "type": "compute_congestion",
-        "window_minutes": WINDOW_MINUTES,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "node_id": node_id
-    })
 
 @app.on_event("startup")
 def on_startup() -> None:
-    # Run one cycle quickly so /summary has data at boot
     engine._ensure_recent_data()
     now = datetime.now(timezone.utc)
-    rows = engine._load_rows(now)
+    rows = engine.loader.load()
     summary = engine.calculator.compute(rows, WINDOW_MINUTES, now)
     store.set(summary)
     engine.start()
+    logger.info("🚀 Server started - distributed task system online")
+
+
+@app.get("/")
+def root():
+    """Redirect to dashboard"""
+    return HTMLResponse("""
+    <html>
+        <head><meta http-equiv="refresh" content="0; url=/dashboard"></head>
+        <body>Redirecting to dashboard...</body>
+    </html>
+    """)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    """Real-time monitoring dashboard"""
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>VABB Distributed Task Monitor</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                background: #0f172a;
+                color: #e2e8f0;
+                padding: 20px;
+            }
+            .header {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 30px;
+                border-radius: 12px;
+                margin-bottom: 20px;
+                box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
+            }
+            h1 { font-size: 2em; margin-bottom: 10px; }
+            .subtitle { opacity: 0.9; font-size: 1.1em; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 20px; }
+            .card {
+                background: #1e293b;
+                padding: 20px;
+                border-radius: 8px;
+                border: 1px solid #334155;
+            }
+            .card h2 {
+                font-size: 1.2em;
+                margin-bottom: 15px;
+                color: #a78bfa;
+            }
+            .stat {
+                display: flex;
+                justify-content: space-between;
+                padding: 10px 0;
+                border-bottom: 1px solid #334155;
+            }
+            .stat:last-child { border-bottom: none; }
+            .stat-label { color: #94a3b8; }
+            .stat-value { font-weight: bold; }
+            .status-alive { color: #10b981; }
+            .status-working { color: #3b82f6; }
+            .status-dead { color: #ef4444; }
+            .status-idle { color: #fbbf24; }
+            .status-pending { color: #fbbf24; }
+            .status-completed { color: #10b981; }
+            .status-failed { color: #ef4444; }
+            .node-item, .task-item {
+                background: #0f172a;
+                padding: 12px;
+                margin: 10px 0;
+                border-radius: 6px;
+                border-left: 4px solid #667eea;
+            }
+            .timestamp {
+                font-size: 0.9em;
+                color: #64748b;
+                margin-top: 5px;
+            }
+            .auto-refresh {
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                background: #10b981;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 20px;
+                font-size: 0.9em;
+                animation: pulse 2s infinite;
+            }
+            @keyframes pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.7; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="auto-refresh">● Auto-refreshing</div>
+        
+        <div class="header">
+            <h1>🛫 VABB Distributed Task Monitor</h1>
+            <div class="subtitle">Real-time task distribution between Mac & Phone nodes</div>
+        </div>
+
+        <div id="content">Loading...</div>
+
+        <script>
+            async function fetchStatus() {
+                const response = await fetch('/status');
+                const data = await response.json();
+                renderStatus(data);
+            }
+
+            function renderStatus(data) {
+                const nodes = data.nodes;
+                const tasks = data.tasks;
+                
+                const html = `
+                    <div class="grid">
+                        <div class="card">
+                            <h2>📊 System Overview</h2>
+                            <div class="stat">
+                                <span class="stat-label">Total Nodes</span>
+                                <span class="stat-value">${nodes.total}</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Alive Nodes</span>
+                                <span class="stat-value status-alive">${nodes.alive}</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Working Nodes</span>
+                                <span class="stat-value status-working">${nodes.working}</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Dead Nodes</span>
+                                <span class="stat-value status-dead">${nodes.dead}</span>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <h2>📋 Task Statistics</h2>
+                            <div class="stat">
+                                <span class="stat-label">Total Tasks</span>
+                                <span class="stat-value">${tasks.total}</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Pending</span>
+                                <span class="stat-value status-pending">${tasks.pending}</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Assigned</span>
+                                <span class="stat-value status-working">${tasks.assigned}</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Completed</span>
+                                <span class="stat-value status-completed">${tasks.completed}</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Failed</span>
+                                <span class="stat-value status-failed">${tasks.failed}</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Queue Size</span>
+                                <span class="stat-value">${tasks.queue_size}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="grid">
+                        <div class="card">
+                            <h2>🖥️ Active Nodes</h2>
+                            ${nodes.details.map(node => `
+                                <div class="node-item">
+                                    <div>
+                                        <strong>${node.node_id}</strong>
+                                        <span class="status-${node.status}"> ● ${node.status.toUpperCase()}</span>
+                                    </div>
+                                    <div class="timestamp">
+                                        Last heartbeat: ${Math.round(node.seconds_since_heartbeat)}s ago
+                                    </div>
+                                    <div style="margin-top: 8px;">
+                                        <span style="color: #64748b;">Tasks:</span>
+                                        <span style="color: #10b981;">✓${node.tasks_completed}</span>
+                                        <span style="color: #ef4444;">✗${node.tasks_failed}</span>
+                                        ${node.current_task ? `<span style="color: #3b82f6;">⚙️ ${node.current_task}</span>` : ''}
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+
+                        <div class="card">
+                            <h2>⚡ Recent Tasks</h2>
+                            ${tasks.recent_tasks.slice(0, 10).map(task => `
+                                <div class="task-item">
+                                    <div>
+                                        <strong>${task.task_id}</strong>
+                                        <span class="status-${task.status}"> ${task.status.toUpperCase()}</span>
+                                    </div>
+                                    <div style="margin-top: 5px; color: #94a3b8;">
+                                        Node: ${task.node_id || 'unassigned'}
+                                        ${task.duration_seconds ? ` | Duration: ${task.duration_seconds.toFixed(1)}s` : ''}
+                                    </div>
+                                    <div class="timestamp">
+                                        Created: ${new Date(task.created_at).toLocaleTimeString()}
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+                
+                document.getElementById('content').innerHTML = html;
+            }
+
+            // Initial fetch
+            fetchStatus();
+            
+            // Auto-refresh every 2 seconds
+            setInterval(fetchStatus, 2000);
+        </script>
+    </body>
+    </html>
+    """)
+
+
+@app.get("/status")
+def get_status() -> Dict[str, Any]:
+    """Get detailed system status"""
+    return task_manager.get_status()
 
 
 @app.get("/summary")
 def get_summary() -> Dict[str, Any]:
+    """Get congestion summary"""
     summary = store.get()
     if summary is None:
         raise HTTPException(status_code=503, detail="Summary not ready")
     return summary
 
 
+@app.post("/node/heartbeat")
+def node_heartbeat(payload: dict):
+    """Register node heartbeat"""
+    node_id = payload.get("node")
+    if not node_id:
+        raise HTTPException(status_code=400, detail="Missing node ID")
+    
+    task_manager.register_node(node_id)
+    return JSONResponse({"status": "ok", "timestamp": time.time()})
+
+
+@app.get("/task")
+def get_task(node_id: str = Query(...)) -> Optional[Dict[str, Any]]:
+    """Get next task for a node"""
+    task_manager.register_node(node_id)  # Also counts as heartbeat
+    task = task_manager.get_next_task(node_id)
+    return task
+
+
+@app.post("/task-result")
+def task_result(result: Dict[str, Any]):
+    """Receive task result from node"""
+    task_id = result.get("task_id")
+    node_id = result.get("node_id")
+    
+    if not task_id or not node_id:
+        raise HTTPException(status_code=400, detail="Missing task_id or node_id")
+    
+    if result.get("status") == "completed":
+        task_manager.complete_task(task_id, node_id, result)
+    else:
+        error = result.get("error", "Unknown error")
+        task_manager.fail_task(task_id, node_id, error)
+    
+    return {"status": "ok"}
+
+
 @app.post("/edge-feedback")
 def edge_feedback(payload: EdgeFeedback) -> Dict[str, Any]:
-    # Log decisions from edge node
+    """Log decisions from edge node"""
     logger.info(
         "Edge decision received: decision=%s notes=%s timestamp=%s",
         payload.decision,
@@ -429,46 +824,10 @@ def edge_feedback(payload: EdgeFeedback) -> Dict[str, Any]:
     )
     return {"status": "ok"}
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import time
-import socket
-
-app = FastAPI(title="VABB Primary Node")
-
-@app.post("/node/heartbeat")
-def node_heartbeat(payload: dict):
-    # Log heartbeat info
-    print("Heartbeat received from node:", payload)
-    return JSONResponse({"status": "ok", "timestamp": time.time()})
-
-
-from fastapi import Query
-
-@app.get("/task")
-def get_task(node_id: str = Query(...)) -> Optional[Dict[str, Any]]:
-    # Generate a task if none exists
-    generate_tasks_for_node(node_id)
-    
-    if node_id in TASKS and TASKS[node_id]:
-        task = TASKS[node_id].popleft()
-        return task
-    return None
-
-
-partial_results: Dict[str, Dict[str, Any]] = {}
-
-@app.post("/task-result")
-def task_result(result: Dict[str, Any]):
-    # Just log results for now
-    logger.info("Received task result from %s: %s", result.get("node_id"), result)
-    return {"status": "ok"}
 
 # -----------------------------
 # Local dev entrypoint
 # -----------------------------
 if __name__ == "__main__":
-    # Run with: uvicorn app:app --host 0.0.0.0 --port 8000
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
