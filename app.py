@@ -144,7 +144,7 @@ class DistributedTaskManager:
                 else:
                     self._nodes[node_id].status = "working"
     
-    def create_task(self, task_type: str, window_minutes: int) -> str:
+    def create_task(self, task_type: str, window_minutes: int, data: Optional[Dict[str, Any]] = None) -> str:
         """Create a new task and add to queue"""
         with self._lock:
             self._task_counter += 1
@@ -159,7 +159,8 @@ class DistributedTaskManager:
                 created_at=now,
                 assigned_at=None,
                 completed_at=None,
-                window_minutes=window_minutes
+                window_minutes=window_minutes,
+                result={"task_data": data} if data else None  # Store task data here
             )
             
             self._tasks[task_id] = task
@@ -191,13 +192,20 @@ class DistributedTaskManager:
             
             logger.info(f"🎯 Task {task_id} assigned to {node_id}")
             
-            return {
+            # Include task data in response
+            task_payload = {
                 "task_id": task_id,
                 "type": task.type,
                 "window_minutes": task.window_minutes,
                 "assigned_at": task.assigned_at.isoformat(),
                 "node_id": node_id
             }
+            
+            # Add task-specific data if available
+            if task.result and "task_data" in task.result:
+                task_payload["data"] = task.result["task_data"]
+            
+            return task_payload
     
     def complete_task(self, task_id: str, node_id: str, result: Dict[str, Any]) -> None:
         """Mark task as completed"""
@@ -372,9 +380,37 @@ class DataGenerator:
         rows: List[TrafficRow] = []
         current = start
         while current <= now:
-            if random.random() < 0.75:
-                movement_type = "arrival" if random.random() < 0.5 else "departure"
-                occupancy_seconds = random.randint(40, 120)
+            # Realistic traffic patterns based on time of day
+            hour = current.hour
+            
+            # Peak hours: 6-9 AM and 5-8 PM (higher traffic)
+            if (6 <= hour <= 9) or (17 <= hour <= 20):
+                traffic_probability = 0.9
+                base_occupancy = 80
+            # Night hours: 11 PM - 5 AM (lower traffic)
+            elif hour >= 23 or hour <= 5:
+                traffic_probability = 0.3
+                base_occupancy = 50
+            # Normal hours
+            else:
+                traffic_probability = 0.65
+                base_occupancy = 65
+            
+            if random.random() < traffic_probability:
+                # Realistic arrival/departure ratio (slightly more arrivals in morning, departures in evening)
+                if 6 <= hour <= 12:
+                    arrival_chance = 0.6
+                elif 17 <= hour <= 21:
+                    arrival_chance = 0.4
+                else:
+                    arrival_chance = 0.5
+                    
+                movement_type = "arrival" if random.random() < arrival_chance else "departure"
+                
+                # More realistic occupancy with variation
+                occupancy_seconds = base_occupancy + random.randint(-20, 40)
+                occupancy_seconds = max(30, min(180, occupancy_seconds))  # Clamp between 30-180s
+                
                 rows.append(
                     TrafficRow(
                         timestamp_utc=current,
@@ -501,8 +537,31 @@ class CongestionEngine:
             summary = self.calculator.compute(rows, WINDOW_MINUTES, now)
             self.store.set(summary)
             
-            # Generate tasks periodically
-            self.task_manager.create_task("compute_congestion", WINDOW_MINUTES)
+            # Prepare traffic data for analysis task
+            window_start = now - timedelta(minutes=WINDOW_MINUTES)
+            recent_rows = [r for r in rows if r.timestamp_utc >= window_start]
+            
+            # Convert traffic rows to serializable format
+            traffic_data = [
+                {
+                    "timestamp_utc": r.timestamp_utc.isoformat(),
+                    "movement_type": r.movement_type,
+                    "runway": r.runway,
+                    "occupancy_seconds": r.occupancy_seconds
+                }
+                for r in recent_rows
+            ]
+            
+            # Generate task with real traffic data
+            task_data = {
+                "traffic_movements": traffic_data,
+                "window_start": window_start.isoformat(),
+                "window_end": now.isoformat(),
+                "airport_code": AIRPORT_CODE,
+                "runway": RUNWAY
+            }
+            
+            self.task_manager.create_task("compute_congestion", WINDOW_MINUTES, task_data)
             
             # Check for timeouts
             self.task_manager.check_timeouts()
