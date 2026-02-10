@@ -394,8 +394,16 @@ class DistributedTaskManager:
                     latest_completed_from_tasks = t.result
                     break
             
-            # Node statistics
-            alive_nodes = [n for n in self._nodes.values() if n.status in ["alive", "idle", "working"]]
+            # Node statistics (derive status from heartbeat + current_task for accuracy)
+            for n in self._nodes.values():
+                if (now - n.last_heartbeat).total_seconds() > NODE_TIMEOUT_SECONDS:
+                    n.status = "dead"
+                elif n.current_task is not None:
+                    n.status = "working"
+                else:
+                    n.status = "idle"
+
+            alive_nodes = [n for n in self._nodes.values() if n.status in ["idle", "working"]]
             working_nodes = [n for n in self._nodes.values() if n.status == "working"]
             dead_nodes = [n for n in self._nodes.values() if n.status == "dead"]
             
