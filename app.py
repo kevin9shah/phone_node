@@ -121,6 +121,7 @@ class DistributedTaskManager:
         self._nodes: Dict[str, NodeInfo] = {}
         self._task_queue: deque = deque()
         self._task_counter = 0
+        self._latest_result: Optional[Dict[str, Any]] = None
         
     def register_node(self, node_id: str) -> None:
         """Register or update node heartbeat"""
@@ -221,6 +222,7 @@ class DistributedTaskManager:
             task.status = TaskStatus.COMPLETED
             task.completed_at = now
             task.result = result
+            self._latest_result = result
             
             # Update node
             if node_id in self._nodes:
@@ -292,12 +294,6 @@ class DistributedTaskManager:
             completed_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.COMPLETED]
             failed_tasks = [t for t in self._tasks.values() if t.status == TaskStatus.FAILED]
             
-            latest_completed_result = None
-            for t in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True):
-                if t.status == TaskStatus.COMPLETED and t.result:
-                    latest_completed_result = t.result
-                    break
-
             return {
                 "timestamp": now.isoformat(),
                 "nodes": {
@@ -343,7 +339,7 @@ class DistributedTaskManager:
                         for t in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True)[:20]
                     ]
                 },
-                "latest_result": latest_completed_result
+                "latest_result": self._latest_result
             }
 
 
