@@ -141,6 +141,10 @@ def send_task_result(result: Dict[str, Any]) -> bool:
     response = make_request("POST", "/task-result", json=result)
     
     if response:
+        try:
+            log("📬", f"Server response: {response.status_code} {response.text.strip()}", "DEBUG")
+        except Exception:
+            pass
         if status == "completed":
             stats.tasks_completed += 1
             log("✅", f"Task {task_id} result sent successfully", "INFO")

@@ -814,6 +814,14 @@ def dashboard():
                                 <div style="color: #94a3b8;">No completed phone results yet.</div>
                             `}
                         </div>
+                        <div class="card">
+                            <h2>🪲 Debug: Raw Latest Result</h2>
+                            ${latest ? `
+                                <pre style="white-space: pre-wrap; color: #94a3b8; font-size: 0.9em;">${JSON.stringify(latest, null, 2)}</pre>
+                            ` : `
+                                <div style="color: #94a3b8;">No latest_result in /status.</div>
+                            `}
+                        </div>
                     </div>
 
                     <div class="grid">
@@ -912,6 +920,7 @@ def task_result(result: Dict[str, Any]):
     """Receive task result from node"""
     task_id = result.get("task_id")
     node_id = result.get("node_id")
+    logger.info("📥 Task result received: task_id=%s node_id=%s status=%s", task_id, node_id, result.get("status"))
     
     if not task_id or not node_id:
         raise HTTPException(status_code=400, detail="Missing task_id or node_id")
