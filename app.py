@@ -29,6 +29,7 @@ import requests
 DATA_FILE = Path(__file__).with_name("sample_runway_data.csv")
 WINDOW_MINUTES = 60
 CYCLE_SECONDS = 45
+TASKS_PER_CYCLE = 5
 AIRPORT_CODE = "VABB"
 AIRPORT_IATA = "BOM"
 RUNWAY = "09/27"
@@ -568,7 +569,8 @@ class CongestionEngine:
                     "runway": RUNWAY
                 }
                 
-                self.task_manager.create_task("compute_congestion", WINDOW_MINUTES, task_data)
+                for _ in range(TASKS_PER_CYCLE):
+                    self.task_manager.create_task("compute_congestion", WINDOW_MINUTES, task_data)
             else:
                 logger.warning("⚠️ No traffic data in window; skipping task creation this cycle")
             
