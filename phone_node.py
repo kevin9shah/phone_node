@@ -2,7 +2,7 @@ import requests
 import time
 import socket
 
-MAC_NODE = "http://172.17.97.42:8000"
+EDGE_URL = "http://10.39.86.168:8000"   # MacBook IP
 
 NODE_ID = socket.gethostname()
 
@@ -14,7 +14,7 @@ while True:
     }
 
     try:
-        r = requests.post(f"{MAC_NODE}/node/heartbeat", json=payload)
+        r = requests.post(f"{EDGE_URL}/node/heartbeat", json=payload)
         print("Sent heartbeat:", r.status_code)
     except Exception as e:
         print("Error:", e)
