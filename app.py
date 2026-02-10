@@ -429,17 +429,64 @@ def node_heartbeat(payload: dict):
 
 
 @app.get("/task")
-def get_task():
-    # Send subset of runway data to edge node
-    # For example, every other interval or only departures
-    task_rows = [...]  # decide what subset to assign
-    return {"task": task_rows}
+def get_task(node_id: str):
+    summary = store.get()
+    if not summary:
+        return {"task": None}
+
+    # Split workload: phone handles departures, Mac handles arrivals
+    if "phone" in node_id.lower():
+        task = {
+            "type": "process_departures",
+            "data": summary.get("departures", []),
+        }
+    else:
+        task = {
+            "type": "process_arrivals",
+            "data": summary.get("arrivals", []),
+        }
+
+    return {"task": task}
+
+
+partial_results: Dict[str, Dict[str, Any]] = {}
 
 @app.post("/task-result")
-def task_result(payload: dict):
-    # Payload: {"node": NODE_ID, "metrics": {...}}
-    # Combine with local summary
-    logger.info(f"Received task result from {payload['node']}")
+def task_result(node_id: str, payload: Dict[str, Any]):
+    logger.info(f"Received task result from {node_id}: {payload}")
+    partial_results[node_id] = payload
+
+    # Combine all partial results to update summary
+    combined_summary = {
+        "traffic_density": 0,
+        "arrival_rate": 0,
+        "departure_rate": 0,
+        "estimated_runway_occupancy": 0,
+        "congestion_level": "low",
+    }
+
+    for r in partial_results.values():
+        combined_summary["traffic_density"] += r.get("traffic_density", 0)
+        combined_summary["arrival_rate"] += r.get("arrival_rate", 0)
+        combined_summary["departure_rate"] += r.get("departure_rate", 0)
+        combined_summary["estimated_runway_occupancy"] += r.get(
+            "estimated_runway_occupancy", 0
+        )
+    # You can apply simple averaging
+    n = len(partial_results)
+    if n:
+        for k in ["traffic_density", "arrival_rate", "departure_rate", "estimated_runway_occupancy"]:
+            combined_summary[k] /= n
+
+    # Optionally recalc congestion level
+    if combined_summary["traffic_density"] > 30 or combined_summary["estimated_runway_occupancy"] > 0.7:
+        combined_summary["congestion_level"] = "high"
+    elif combined_summary["traffic_density"] > 15 or combined_summary["estimated_runway_occupancy"] > 0.4:
+        combined_summary["congestion_level"] = "medium"
+    else:
+        combined_summary["congestion_level"] = "low"
+
+    store.set(combined_summary)
     return {"status": "ok"}
 
 # -----------------------------

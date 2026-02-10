@@ -1,37 +1,26 @@
-import requests, socket, time
+import requests
+import socket
+import time
 
-PRIMARY_NODE = "http://10.39.86.168:8000"  # MacBook IP
-NODE_ID = socket.gethostname()
+EDGE_URL = "http://10.39.86.168:8000"  # Mac IP
+NODE_ID = "phone-node-1"
 
 while True:
-    # 1. Send heartbeat
-    try:
-        requests.post(f"{PRIMARY_NODE}/node/heartbeat", json={
-            "node": NODE_ID,
-            "status": "alive",
-            "timestamp": time.time()
-        })
-    except:
-        pass
+    # Heartbeat
+    requests.post(f"{EDGE_URL}/node/heartbeat", json={"node": NODE_ID, "status": "alive", "timestamp": time.time()})
 
-    # 2. Fetch task
-    try:
-        resp = requests.get(f"{PRIMARY_NODE}/task").json()
-        task_rows = resp.get("task", [])
-
-        # 3. Process task
-        # Example: compute traffic_density for subset
-        arrivals = sum(1 for r in task_rows if r['movement_type']=='arrival')
-        departures = sum(1 for r in task_rows if r['movement_type']=='departure')
-        total = arrivals + departures
-        metrics = {"arrivals": arrivals, "departures": departures, "total": total}
-
-        # 4. Send results back
-        requests.post(f"{PRIMARY_NODE}/task-result", json={
-            "node": NODE_ID,
-            "metrics": metrics
-        })
-    except:
-        pass
+    # Fetch task
+    r = requests.get(f"{EDGE_URL}/task", params={"node_id": NODE_ID})
+    task = r.json().get("task")
+    if task:
+        # Process departures only
+        if task["type"] == "process_departures":
+            data = task["data"]
+            # Example: compute partial summary
+            total = len(data)
+            departure_rate = total / 1  # simplistic
+            result = {"departure_rate": departure_rate, "traffic_density": total, "estimated_runway_occupancy": total*0.05}
+            # Send result back
+            requests.post(f"{EDGE_URL}/task-result", json=result, params={"node_id": NODE_ID})
 
     time.sleep(10)
