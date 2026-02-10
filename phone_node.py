@@ -1,7 +1,7 @@
 import requests
 import time
 
-SERVER_URL = "http://<MAC_IP>:8000"  # replace with your Mac's LAN IP
+SERVER_URL = "http://10.39.86.168:8000"  # replace with your Mac's LAN IP
 NODE_ID = "phone-node-1"
 HEARTBEAT_INTERVAL = 5  # seconds
 TASK_INTERVAL = 10      # seconds
