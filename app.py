@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import requests
+from collections import deque
 
 # -----------------------------
 # Configuration
@@ -36,6 +37,8 @@ AVIATIONSTACK_BASE_URL = "https://api.aviationstack.com/v1/flights"
 # Free tiers can be tight; fetch less often and reuse cached API results
 AVIATIONSTACK_MIN_FETCH_SECONDS = 300
 DEFAULT_OCCUPANCY_SECONDS = 75
+# Task queues per node
+TASKS: Dict[str, deque] = {}
 
 # -----------------------------
 # Logging
@@ -383,6 +386,18 @@ app = FastAPI(title="VABB Primary Node")
 store = SummaryStore()
 engine = CongestionEngine(DATA_FILE, store)
 
+def generate_tasks_for_node(node_id: str):
+    """Simulate tasks for a node."""
+    if node_id not in TASKS:
+        TASKS[node_id] = deque()
+    
+    # Example tasks: compute congestion for the last hour
+    TASKS[node_id].append({
+        "type": "compute_congestion",
+        "window_minutes": WINDOW_MINUTES,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "node_id": node_id
+    })
 
 @app.on_event("startup")
 def on_startup() -> None:
@@ -428,65 +443,25 @@ def node_heartbeat(payload: dict):
     return JSONResponse({"status": "ok", "timestamp": time.time()})
 
 
+from fastapi import Query
+
 @app.get("/task")
-def get_task(node_id: str):
-    summary = store.get()
-    if not summary:
-        return {"task": None}
-
-    # Split workload: phone handles departures, Mac handles arrivals
-    if "phone" in node_id.lower():
-        task = {
-            "type": "process_departures",
-            "data": summary.get("departures", []),
-        }
-    else:
-        task = {
-            "type": "process_arrivals",
-            "data": summary.get("arrivals", []),
-        }
-
-    return {"task": task}
+def get_task(node_id: str = Query(...)) -> Optional[Dict[str, Any]]:
+    # Generate a task if none exists
+    generate_tasks_for_node(node_id)
+    
+    if node_id in TASKS and TASKS[node_id]:
+        task = TASKS[node_id].popleft()
+        return task
+    return None
 
 
 partial_results: Dict[str, Dict[str, Any]] = {}
 
 @app.post("/task-result")
-def task_result(node_id: str, payload: Dict[str, Any]):
-    logger.info(f"Received task result from {node_id}: {payload}")
-    partial_results[node_id] = payload
-
-    # Combine all partial results to update summary
-    combined_summary = {
-        "traffic_density": 0,
-        "arrival_rate": 0,
-        "departure_rate": 0,
-        "estimated_runway_occupancy": 0,
-        "congestion_level": "low",
-    }
-
-    for r in partial_results.values():
-        combined_summary["traffic_density"] += r.get("traffic_density", 0)
-        combined_summary["arrival_rate"] += r.get("arrival_rate", 0)
-        combined_summary["departure_rate"] += r.get("departure_rate", 0)
-        combined_summary["estimated_runway_occupancy"] += r.get(
-            "estimated_runway_occupancy", 0
-        )
-    # You can apply simple averaging
-    n = len(partial_results)
-    if n:
-        for k in ["traffic_density", "arrival_rate", "departure_rate", "estimated_runway_occupancy"]:
-            combined_summary[k] /= n
-
-    # Optionally recalc congestion level
-    if combined_summary["traffic_density"] > 30 or combined_summary["estimated_runway_occupancy"] > 0.7:
-        combined_summary["congestion_level"] = "high"
-    elif combined_summary["traffic_density"] > 15 or combined_summary["estimated_runway_occupancy"] > 0.4:
-        combined_summary["congestion_level"] = "medium"
-    else:
-        combined_summary["congestion_level"] = "low"
-
-    store.set(combined_summary)
+def task_result(result: Dict[str, Any]):
+    # Just log results for now
+    logger.info("Received task result from %s: %s", result.get("node_id"), result)
     return {"status": "ok"}
 
 # -----------------------------
