@@ -414,6 +414,33 @@ def edge_feedback(payload: EdgeFeedback) -> Dict[str, Any]:
     )
     return {"status": "ok"}
 
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+import time
+import socket
+
+app = FastAPI(title="VABB Primary Node")
+
+@app.post("/node/heartbeat")
+def node_heartbeat(payload: dict):
+    # Log heartbeat info
+    print("Heartbeat received from node:", payload)
+    return JSONResponse({"status": "ok", "timestamp": time.time()})
+
+
+@app.get("/task")
+def get_task():
+    # Send subset of runway data to edge node
+    # For example, every other interval or only departures
+    task_rows = [...]  # decide what subset to assign
+    return {"task": task_rows}
+
+@app.post("/task-result")
+def task_result(payload: dict):
+    # Payload: {"node": NODE_ID, "metrics": {...}}
+    # Combine with local summary
+    logger.info(f"Received task result from {payload['node']}")
+    return {"status": "ok"}
 
 # -----------------------------
 # Local dev entrypoint
