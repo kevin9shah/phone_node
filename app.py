@@ -41,6 +41,50 @@ NODE_TIMEOUT_SECONDS = 30  # Consider node dead if no heartbeat for 30s
 TASK_TIMEOUT_SECONDS = 60  # Task considered stale if not completed in 60s
 WORKING_GRACE_SECONDS = 5  # Keep node in WORKING briefly after activity
 
+OPENSKY_USERNAME = os.getenv("OPENSKY_USERNAME")
+OPENSKY_PASSWORD = os.getenv("OPENSKY_PASSWORD")
+OPENSKY_BASE_URL = "https://opensky-network.org/api"
+OPENSKY_MIN_FETCH_SECONDS = 60
+OPENSKY_TIMEOUT_SECONDS = 20
+
+AIRPORTS = [
+    {
+        "name": "Mumbai",
+        "icao": "VABB",
+        "iata": "BOM",
+        "runway": "09/27",
+        "bbox": None,  # [min_lat, max_lat, min_lon, max_lon] for OpenSky /states/all fallback
+    },
+    {
+        "name": "Delhi",
+        "icao": "VIDP",
+        "iata": "DEL",
+        "runway": "UNKNOWN",
+        "bbox": None,
+    },
+    {
+        "name": "Ahmedabad",
+        "icao": "VAAH",
+        "iata": "AMD",
+        "runway": "UNKNOWN",
+        "bbox": None,
+    },
+    {
+        "name": "Chennai",
+        "icao": "VOMM",
+        "iata": "MAA",
+        "runway": "UNKNOWN",
+        "bbox": None,
+    },
+    {
+        "name": "Bangalore",
+        "icao": "VOBL",
+        "iata": "BLR",
+        "runway": "UNKNOWN",
+        "bbox": None,
+    },
+]
+
 # -----------------------------
 # Logging
 # -----------------------------
@@ -626,6 +670,76 @@ class DataGenerator:
 
 
 # -----------------------------
+# OpenSky Fetching
+# -----------------------------
+class OpenSkyClient:
+    def __init__(self):
+        self.base_url = OPENSKY_BASE_URL
+        self.username = OPENSKY_USERNAME
+        self.password = OPENSKY_PASSWORD
+
+    def _get(self, path: str, params: Dict[str, Any]) -> tuple[List[Dict[str, Any]], Optional[int]]:
+        url = f"{self.base_url}{path}"
+        auth = None
+        if self.username and self.password:
+            auth = (self.username, self.password)
+        try:
+            resp = requests.get(url, params=params, auth=auth, timeout=OPENSKY_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+            return (data if isinstance(data, list) else []), resp.status_code
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 404 and not auth:
+                logger.warning(
+                    "OpenSky request failed (404). OpenSky now requires login for /flights endpoints. "
+                    "Set OPENSKY_USERNAME and OPENSKY_PASSWORD."
+                )
+            elif status == 429:
+                logger.warning("OpenSky request failed (429 rate limit). Backing off for this airport.")
+            else:
+                logger.warning(
+                    "OpenSky request failed: status=%s url=%s params=%s",
+                    status,
+                    url,
+                    params,
+                )
+            return [], status
+        except Exception as e:
+            logger.warning("OpenSky request failed: %s", str(e))
+            return [], None
+
+    def get_arrivals(self, airport_icao: str, begin: int, end: int) -> tuple[List[Dict[str, Any]], Optional[int]]:
+        return self._get("/flights/arrival", {"airport": airport_icao, "begin": begin, "end": end})
+
+    def get_departures(self, airport_icao: str, begin: int, end: int) -> tuple[List[Dict[str, Any]], Optional[int]]:
+        return self._get("/flights/departure", {"airport": airport_icao, "begin": begin, "end": end})
+
+    def get_states(self, bbox: List[float]) -> tuple[List[List[Any]], Optional[int]]:
+        params = {"lamin": bbox[0], "lamax": bbox[1], "lomin": bbox[2], "lomax": bbox[3]}
+        url = f"{self.base_url}/states/all"
+        auth = None
+        if self.username and self.password:
+            auth = (self.username, self.password)
+        try:
+            resp = requests.get(url, params=params, auth=auth, timeout=OPENSKY_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+            states = data.get("states") if isinstance(data, dict) else None
+            return (states if isinstance(states, list) else []), resp.status_code
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 429:
+                logger.warning("OpenSky states failed (429 rate limit).")
+            else:
+                logger.warning("OpenSky states failed: status=%s url=%s params=%s", status, url, params)
+            return [], status
+        except Exception as e:
+            logger.warning("OpenSky states failed: %s", str(e))
+            return [], None
+
+
+# -----------------------------
 # Metrics Calculation
 # -----------------------------
 class MetricsCalculator:
@@ -703,6 +817,8 @@ class CongestionEngine:
         self.loader = DataLoader(data_file)
         self.generator = DataGenerator(data_file)
         self.calculator = MetricsCalculator()
+        self.opensky = OpenSkyClient()
+        self._opensky_cache: Dict[str, Dict[str, Any]] = {}
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
